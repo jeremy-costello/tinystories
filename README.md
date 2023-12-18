@@ -22,3 +22,4 @@ This requires Hadoop. I used [this guide](https://kontext.tech/article/978/insta
 - add docstrings
 - add explanations for parameters
 - find good settings for stable training
+- parameter groups for weight decay
