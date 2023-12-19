@@ -8,25 +8,37 @@ from parameters import get_param_dict
 
 def main():
     session_name = "reader-test"
+    data_splits = ["train", "valid"]
+    
+    generate_dataset(session_name, data_splits)
+
+
+def generate_dataset(session_name, data_splits):
+    for data_split in data_splits:
+        assert data_split in ["train", "valid"]
     
     param_dict = get_param_dict(session_name, load_spark=True, load_schema=True)
-    shuffle_dataset(spark=param_dict["spark"],
-                    tokenized_parquet_name=param_dict["tokenizer"]["tokenized_parquet_name"],
-                    context_length=param_dict["model"]["context_length"],
-                    dataset_url=param_dict["dataset"]["dataset_url"],
-                    hdfs_home=param_dict["dataset"]["hdfs_home"],
-                    row_group_size_mb=param_dict["dataset"]["row_group_size_mb"],
-                    num_spark_workers=param_dict["dataset"]["num_spark_workers"],
-                    petastorm_schema=param_dict["dataset"]["petastorm_schema"])
+
+    for data_split in data_splits:
+        shuffle_dataset(spark=param_dict["spark"],
+                        data_split=data_split,
+                        tokenized_parquet_root=param_dict["tokenizer"]["tokenized_parquet_root"],
+                        context_length=param_dict["model"]["context_length"],
+                        dataset_url=param_dict["dataset"]["dataset_url"],
+                        hdfs_home=param_dict["dataset"]["hdfs_home"],
+                        row_group_size_mb=param_dict["dataset"]["row_group_size_mb"],
+                        num_spark_workers=param_dict["dataset"]["num_spark_workers"],
+                        petastorm_schema=param_dict["dataset"]["petastorm_schema"])
+    
     param_dict["spark"].stop()
 
 
-def shuffle_dataset(spark, tokenized_parquet_name, context_length, dataset_url, hdfs_home,
+def shuffle_dataset(spark, data_split, tokenized_parquet_root, context_length, dataset_url, hdfs_home,
                     row_group_size_mb, num_spark_workers, petastorm_schema, partitions=None, row_limit=None):
+    
+    hadoop_url = f"{hdfs_home}/{tokenized_parquet_root}-{data_split}.parquet"
 
-    hadoop_url = f"{hdfs_home}/{tokenized_parquet_name}.parquet"
-
-    df = spark.read.parquet(f"{tokenized_parquet_name}.parquet")
+    df = spark.read.parquet(f"{tokenized_parquet_root}-{data_split}.parquet")
 
     def split_to_ctx(arrays):
         new_arrays = []
@@ -63,8 +75,9 @@ def shuffle_dataset(spark, tokenized_parquet_name, context_length, dataset_url, 
     if partitions is not None:
         df.repartition(partitions)
     
+    dataset_url_data_split = f"{dataset_url}/{data_split}"
     with materialize_dataset(spark, hadoop_url, petastorm_schema, row_group_size_mb):
-        df.write.mode("overwrite").parquet(dataset_url)
+        df.write.mode("overwrite").parquet(dataset_url_data_split)
 
 
 if __name__ == "__main__":

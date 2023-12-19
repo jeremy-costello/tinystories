@@ -5,9 +5,10 @@ from pyspark.sql import SparkSession
 from petastorm.reader import make_reader
 from petastorm.pytorch import DataLoader
 from lightning.pytorch.loggers import MLFlowLogger
-from transformers import GPTNeoConfig, GPTNeoForCausalLM, PreTrainedTokenizerFast
+from transformers import GPT2Config, GPT2LMHeadModel, PreTrainedTokenizerFast
+from transformers.pytorch_utils import Conv1D
 
-from reader import shuffle_dataset
+from reader import generate_dataset, shuffle_dataset
 from parameters import get_param_dict
 
 
@@ -19,22 +20,18 @@ def main():
 
 
 def train_model(session_name, param_dict):
+    # not sure if having this at the context length affects anything
     n_positions = 2 * param_dict["model"]["context_length"]
 
-    num_layers = param_dict["model"]["num_layers"]
-    assert num_layers % 2 == 0
-    attention_types = [[["global", "local"], num_layers // 2]]
-
-    config = GPTNeoConfig(
+    config = GPT2Config(
         vocab_size=param_dict["tokenizer"]["vocab_size"],
-        max_position_embeddings=n_positions,
-        hidden_size=param_dict["model"]["hidden_size"],
-        num_layers=param_dict["model"]["num_layers"],
-        attention_types=attention_types,
-        num_heads=param_dict["model"]["num_heads"],
-        resid_dropout=param_dict["model"]["resid_pdrop"],
-        embed_dropout=param_dict["model"]["embd_pdrop"],
-        attention_dropout=param_dict["model"]["attn_pdrop"],
+        n_positions=n_positions,
+        n_embd=param_dict["model"]["hidden_size"],
+        n_layer=param_dict["model"]["num_layers"],
+        n_head=param_dict["model"]["num_heads"],
+        resid_pdrop=param_dict["model"]["resid_pdrop"],
+        embd_pdrop=param_dict["model"]["embd_pdrop"],
+        attn_pdrop=param_dict["model"]["attn_pdrop"],
         bos_token_id=0,
         eos_token_id=0
     )
@@ -56,9 +53,19 @@ def train_model(session_name, param_dict):
         logger=mlf_logger,
         max_steps=param_dict["training"]["max_steps"],
         accumulate_grad_batches=param_dict["training"]["accumulate_grad_batches"],
-        gradient_clip_val=param_dict["training"]["gradient_clip_val"])
+        gradient_clip_val=param_dict["training"]["gradient_clip_val"],
+        val_check_interval=param_dict["training"]["val_check_interval"],
+        check_val_every_n_epoch=None,
+        num_sanity_val_steps=0)
     
-    trainer.fit(model)
+    generate_dataset(session_name, data_splits=["valid"])
+    
+    dataset_url = param_dict["dataset"]["dataset_url"]
+    dataset_url_data_split = f"{dataset_url}/valid"
+    petastorm_reader = make_reader(dataset_url_data_split)
+    valid_loader = DataLoader(petastorm_reader, batch_size=param_dict["training"]["batch_size"])
+    
+    trainer.fit(model, val_dataloaders=[valid_loader])
 
 
 class Transformer(L.LightningModule):
@@ -68,6 +75,7 @@ class Transformer(L.LightningModule):
         self.shuffle_data = param_dict["training"]["shuffle_data"]
         self.learning_rate = param_dict["training"]["learning_rate"]
         self.betas = param_dict["training"]["betas"]
+        self.weight_decay = param_dict["training"]["weight_decay"]
         self.final_lr_multiplier = param_dict["training"]["final_lr_multiplier"]
         self.max_steps = param_dict["training"]["max_steps"]
         self.warmup_steps = param_dict["training"]["warmup_steps"]
@@ -77,12 +85,14 @@ class Transformer(L.LightningModule):
 
         self.param_dict = param_dict
 
-        self.model = GPTNeoForCausalLM(config)
+        self.model = GPT2LMHeadModel(config)
         self.tokenizer = PreTrainedTokenizerFast(
             tokenizer_file=param_dict["tokenizer"]["tokenizer_save_location"]
         )
+        self.tokenizer.bos_token = param_dict["tokenizer"]["eos_token"]
+        self.tokenizer.eos_token = param_dict["tokenizer"]["eos_token"]
 
-        self.step_loss = 0
+        self.logger_step = 0
     
     def forward(self, input_ids, attention_mask):
         return self.model(
@@ -92,19 +102,21 @@ class Transformer(L.LightningModule):
         )
 
     def training_step(self, batch, batch_idx):
-        input_ids = batch["input_ids"]
+        input_ids = batch["input_ids"]        
         attention_mask = torch.ones_like(input_ids)
         outputs = self(input_ids, attention_mask)
 
-        loss = outputs["loss"]
+        loss = outputs.loss
+        self.average_train_loss += loss
         return loss
 
-    def on_before_backward(self, loss):
-        self.step_loss += loss
+    def on_train_start(self):
+        self.average_train_loss = 0
     
     def on_before_optimizer_step(self, optimizer):
-        self.logger.experiment.log_metric(self.logger.run_id, "loss", self.step_loss)
-        self.step_loss = 0
+        self.logger.experiment.log_metric(self.logger.run_id, "train_loss", self.average_train_loss, step=self.logger_step)
+        self.average_train_loss = 0
+        self.logger_step += 1
     
     def on_before_zero_grad(self, optimizer):
         if self.global_step % self.save_model_interval == 0:
@@ -112,6 +124,23 @@ class Transformer(L.LightningModule):
     
     def on_train_end(self):
         self.save_huggingface_model()
+    
+    def validation_step(self, batch, batch_idx, dataloader_idx=0):
+        input_ids = batch["input_ids"]
+        attention_mask = torch.ones_like(input_ids)
+        outputs = self(input_ids, attention_mask)
+
+        loss = outputs.loss
+        self.average_valid_loss = \
+            batch_idx / (batch_idx + 1) * self.average_valid_loss + 1 / (batch_idx + 1) * loss
+        
+        return loss
+
+    def on_validation_start(self):
+        self.average_valid_loss = 0
+    
+    def on_validation_end(self):
+        self.logger.experiment.log_metric(self.logger.run_id, "valid_loss", self.average_valid_loss, step=self.logger_step)
     
     def calculate_learning_rate(self, step):
         real_step = step + 1
@@ -121,11 +150,50 @@ class Transformer(L.LightningModule):
             lr_mult = self.final_lr_multiplier  + 0.5 * (1 - self.final_lr_multiplier) * \
                 (1 + math.cos(math.pi * (real_step - self.warmup_steps) / (self.max_steps - self.warmup_steps)))
         
-        self.logger.experiment.log_metric(self.logger.run_id, "lr", self.learning_rate * lr_mult, step=self.global_step)
+        self.logger.experiment.log_metric(self.logger.run_id, "lr", self.learning_rate * lr_mult, step=self.logger_step)
         return lr_mult
 
+    def get_weight_decay_groups(self):
+        # https://github.com/karpathy/minGPT/blob/master/mingpt/model.py
+        decay = set()
+        no_decay = set()
+        whitelist_weight_modules = (torch.nn.Linear, Conv1D)
+        blacklist_weight_modules = (torch.nn.LayerNorm, torch.nn.Embedding)
+
+        lm_head_name = "model.lm_head.weight"
+
+        for mn, m in self.named_modules():
+            for pn, p in m.named_parameters():
+                fpn = '%s.%s' % (mn, pn) if mn else pn
+
+                # same parameter as 'model.transformer.wte.weight'
+                if fpn == lm_head_name:
+                    continue
+                
+                if pn.endswith('bias'):
+                    no_decay.add(fpn)
+                elif pn.endswith('weight') and isinstance(m, whitelist_weight_modules):
+                    decay.add(fpn)
+                elif pn.endswith('weight') and isinstance(m, blacklist_weight_modules):
+                    no_decay.add(fpn)
+
+        param_dict = {pn: p for pn, p in self.named_parameters()}
+        inter_params = decay & no_decay
+        union_params = decay | no_decay
+        assert len(inter_params) == 0, "parameters %s made it into both decay/no_decay sets!" % (str(inter_params), )
+        assert len(param_dict.keys() - union_params) == 0, "parameters %s were not separated into either decay/no_decay set!" \
+                                                    % (str(param_dict.keys() - union_params), )
+
+        optim_groups = [
+            {"params": [param_dict[pn] for pn in sorted(list(decay))], "weight_decay": self.weight_decay},
+            {"params": [param_dict[pn] for pn in sorted(list(no_decay))], "weight_decay": 0.0},
+        ]
+
+        return optim_groups
+
     def configure_optimizers(self):
-        optimizer = torch.optim.AdamW(self.parameters(),
+        optim_groups = self.get_weight_decay_groups()
+        optimizer = torch.optim.AdamW(optim_groups,
                                       lr=self.learning_rate,
                                       betas=(self.betas))
 
@@ -145,29 +213,36 @@ class Transformer(L.LightningModule):
     
     def on_epoch_start(self):
         self.trainer.train_dataloader = self.train_dataloader()
+        self.within_epoch_step = 0
     
     def on_epoch_end(self):
         self.trainer.train_dataloader.__exit__(None, None, None)
-    
-    def train_dataloader(self):
-        session_name = "petastorm-reader"
+            
+    def get_dataloader(self, data_split, shuffle_data):
+        session_name = f"petastorm-reader-{data_split}"
 
-        if self.shuffle_data:
+        if shuffle_data:
             spark = SparkSession.builder.appName(session_name).getOrCreate()
             shuffle_dataset(spark=spark,
-                            tokenized_parquet_name=self.param_dict["tokenizer"]["tokenized_parquet_name"],
+                            data_split=data_split,
+                            tokenized_parquet_root=self.param_dict["tokenizer"]["tokenized_parquet_root"],
                             context_length=self.param_dict["model"]["context_length"],
-                            dataset_url=self.param_dict["dataset"]["dataset_url"],
+                            dataset_url=self.dataset_url,
                             hdfs_home=self.param_dict["dataset"]["hdfs_home"],
                             row_group_size_mb=self.param_dict["dataset"]["row_group_size_mb"],
                             num_spark_workers=self.param_dict["dataset"]["num_spark_workers"],
                             petastorm_schema=self.param_dict["dataset"]["petastorm_schema"])
             spark.stop()
 
-        petastorm_reader = make_reader(self.dataset_url)
+        dataset_url_data_split = f"{self.dataset_url}/{data_split}"
+        petastorm_reader = make_reader(dataset_url_data_split)
         loader = DataLoader(petastorm_reader, batch_size=self.batch_size)
         return loader
-    
+
+    def train_dataloader(self):
+        loader = self.get_dataloader("train", shuffle_data=self.shuffle_data)
+        return loader
+        
     def save_huggingface_model(self):
         self.model.save_pretrained(f"./models/{self.logger.run_id}/{self.global_step}")
 

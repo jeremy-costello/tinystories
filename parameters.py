@@ -5,14 +5,15 @@ param_dict = {
         "tokenizer_save_location": "./tokenizers/tinystories.json",
         "vocab_size": 10000,
         "batch_size": 256,
-        "tokenized_parquet_name": "tinystories-tokenized"
+        "tokenized_parquet_root": "tinystories-tokenized"
     },
     "dataset": {
-        "raw_text_file": "./texts/TinyStoriesV2-GPT4-train.txt",
-        "preprocessed_file": "tinystories.txt",
+        "text_folder": "./texts",
+        "raw_text_file_root": "TinyStoriesV2-GPT4",
+        "preprocessed_file_root": "tinystories",
         "splitter": "<|SPLIT|>\n",
-        "data_parquet_name": "tinystories",
-        "dataset_url": "file:///home/jeremy/python/gan/petastorm_data",
+        "data_parquet_root": "tinystories",
+        "dataset_url": "file:///home/jeremy/github/tinystories/petastorm_data",
         "hdfs_home": "hdfs://localhost:9000/user/jeremy",
         "row_group_size_mb": 128,
         "num_spark_workers": 4
@@ -22,25 +23,27 @@ param_dict = {
         "devices": 1,
         "strategy": "deepspeed_stage_1",
         "precision": "bf16-mixed",
-        "shuffle_data": True,
-        "max_steps": 100000,
-        "warmup_steps": 20000,
-        "accumulate_grad_batches": 1,
+        "shuffle_data": False,
+        "max_steps": 5000,
+        "warmup_steps": 1000,
+        "accumulate_grad_batches": 64,
         "gradient_clip_val": 1.0,
+        "val_check_interval": 1600,
         "batch_size": 32,
         "learning_rate": 2e-4,
         "betas": (0.9, 0.95),
+        "weight_decay": 0.01,
         "final_lr_multiplier": 0.1,
-        "save_model_interval": 1000
+        "save_model_interval": 250
     },
     "model": {
         "context_length": 512,
         "hidden_size": 64,
         "num_layers": 8,
         "num_heads": 16,
-        "resid_pdrop": 0.0,
-        "embd_pdrop": 0.0,
-        "attn_pdrop": 0.0
+        "resid_pdrop": 0.1,
+        "embd_pdrop": 0.1,
+        "attn_pdrop": 0.1
     }
 }
 

@@ -9,10 +9,10 @@ def main():
     param_dict = get_param_dict(session_name, load_spark=True)
     train_tokenizer(
         spark=param_dict["spark"],
-        preprocessed_file=param_dict["dataset"]["preprocessed_file"],
+        preprocessed_file_root=param_dict["dataset"]["preprocessed_file_root"],
         eos_token=param_dict["tokenizer"]["eos_token"],
         splitter=param_dict["dataset"]["splitter"],
-        data_parquet_name=param_dict["dataset"]["data_parquet_name"],
+        data_parquet_root=param_dict["dataset"]["data_parquet_root"],
         tokenizer_save_location=param_dict["tokenizer"]["tokenizer_save_location"],
         vocab_size=param_dict["tokenizer"]["vocab_size"],
         tokenizer_batch_size=param_dict["tokenizer"]["batch_size"]
@@ -20,13 +20,13 @@ def main():
     param_dict["spark"].stop()
 
 
-def train_tokenizer(spark, preprocessed_file, eos_token, splitter, data_parquet_name,
+def train_tokenizer(spark, preprocessed_file_root, eos_token, splitter, data_parquet_root,
                     tokenizer_save_location, vocab_size, tokenizer_batch_size):
     tok_class = PySparkTokenizer(
         spark=spark,
-        preprocessed_file=preprocessed_file,
+        preprocessed_file_root=preprocessed_file_root,
         splitter=splitter,
-        data_parquet_name=data_parquet_name
+        data_parquet_root=data_parquet_root
     )
     tok_class.train_tokenizer(
         vocab_size=vocab_size,
@@ -37,16 +37,16 @@ def train_tokenizer(spark, preprocessed_file, eos_token, splitter, data_parquet_
 
 
 class PySparkTokenizer:
-    def __init__(self, spark, preprocessed_file, splitter, data_parquet_name, load_from_parquet=False):
-        if load_from_parquet:
-            assert data_parquet_name is not None
-            self.df = spark.read.parquet(f"{data_parquet_name}.parquet")
-        else:
-            self.df = spark.read.text(preprocessed_file, lineSep=splitter)
-            self.df.write.parquet(f"{data_parquet_name}.parquet", mode="overwrite")
+    def __init__(self, spark, preprocessed_file_root, splitter, data_parquet_root):
+        self.df = dict()
+
+        for data_split in ["train", "valid"]:
+            preprocessed_file = f"{preprocessed_file_root}-{data_split}.txt"
+            self.df[data_split] = spark.read.text(preprocessed_file, lineSep=splitter)
+            self.df[data_split].write.parquet(f"{data_parquet_root}-{data_split}.parquet", mode="overwrite")
     
     def batch_iterator(self, batch_size):
-        iterator = self.df.rdd.toLocalIterator()
+        iterator = self.df["train"].rdd.toLocalIterator()
 
         batch = []
         for i, row in enumerate(iterator):
@@ -68,7 +68,7 @@ class PySparkTokenizer:
             special_tokens=special_tokens
         )
 
-        length = self.df.count()
+        length = self.df["train"].count()
         tokenizer.train_from_iterator(self.batch_iterator(batch_size), trainer=trainer, length=length)
 
         self.tokenizer = tokenizer
