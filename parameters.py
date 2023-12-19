@@ -23,18 +23,17 @@ param_dict = {
         "devices": 1,
         "strategy": "deepspeed_stage_1",
         "precision": "bf16-mixed",
-        "shuffle_data": False,
-        "max_steps": 5000,
+        "shuffle_data": True,
+        "max_steps": 20000,
         "warmup_steps": 1000,
-        "accumulate_grad_batches": 64,
+        "accumulate_grad_batches": 4,
         "gradient_clip_val": 1.0,
-        "val_check_interval": 1600,
+        "val_check_interval": 640,
         "batch_size": 32,
         "learning_rate": 2e-4,
         "betas": (0.9, 0.95),
         "weight_decay": 0.01,
-        "final_lr_multiplier": 0.1,
-        "save_model_interval": 250
+        "final_lr_multiplier": 0.1
     },
     "model": {
         "context_length": 512,

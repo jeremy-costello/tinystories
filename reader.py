@@ -1,14 +1,17 @@
 import math
+import numpy as np
+from io import BytesIO
 import pyspark.sql.types as T
 import pyspark.sql.functions as F
 from petastorm.etl.dataset_metadata import materialize_dataset
+from petastorm.unischema import dict_to_spark_row
 
 from parameters import get_param_dict
 
 
 def main():
     session_name = "reader-test"
-    data_splits = ["train", "valid"]
+    data_splits = ["valid"]
     
     generate_dataset(session_name, data_splits)
 
@@ -52,8 +55,18 @@ def shuffle_dataset(spark, data_split, tokenized_parquet_root, context_length, d
 
         return new_arrays
 
-    udf_schema = T.ArrayType(T.ArrayType(T.LongType()))
-    split_to_ctx_spark = spark.udf.register("split_to_ctx", split_to_ctx, udf_schema)
+    stc_schema = T.ArrayType(T.ArrayType(T.LongType()))
+    split_to_ctx_spark = spark.udf.register("split_to_ctx", split_to_ctx, stc_schema)
+
+    def list_to_numpy_bytes(input_ids_list):
+        # https://petastorm.readthedocs.io/en/latest/_modules/petastorm/codecs.html#NdarrayCodec
+        input_ids_array = np.array(input_ids_list, dtype=np.int64)
+        with BytesIO() as memfile:
+            np.save(memfile, input_ids_array)
+            return bytearray(memfile.getvalue())
+
+    ltnb_schema = T.BinaryType()
+    list_to_numpy_bytes_spark = spark.udf.register("list_to_numpy_bytes", list_to_numpy_bytes, ltnb_schema)
 
     df = df.select(F.col("input_ids"))
 
@@ -66,8 +79,10 @@ def shuffle_dataset(spark, data_split, tokenized_parquet_root, context_length, d
     df = df.groupBy("group").agg(F.collect_list("input_ids").alias("input_ids"))
     df = df.drop(F.col("group"))
 
-    df = df.withColumn("input_ids", split_to_ctx_spark("input_ids"))
+    df = df.withColumn("input_ids", split_to_ctx_spark(F.col("input_ids")))
     df = df.withColumn("input_ids", F.explode(df["input_ids"]))
+
+    df = df.withColumn("input_ids", list_to_numpy_bytes_spark(F.col("input_ids")))
 
     if row_limit is not None:
         df = df.limit(row_limit)

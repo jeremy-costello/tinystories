@@ -20,7 +20,6 @@ def main():
 
 
 def train_model(session_name, param_dict):
-    # not sure if having this at the context length affects anything
     n_positions = 2 * param_dict["model"]["context_length"]
 
     config = GPT2Config(
@@ -80,7 +79,6 @@ class Transformer(L.LightningModule):
         self.max_steps = param_dict["training"]["max_steps"]
         self.warmup_steps = param_dict["training"]["warmup_steps"]
         self.batch_size = param_dict["training"]["batch_size"]
-        self.save_model_interval = param_dict["training"]["save_model_interval"]
         self.dataset_url = param_dict["dataset"]["dataset_url"]
 
         self.param_dict = param_dict
@@ -102,7 +100,7 @@ class Transformer(L.LightningModule):
         )
 
     def training_step(self, batch, batch_idx):
-        input_ids = batch["input_ids"]        
+        input_ids = batch["input_ids"]
         attention_mask = torch.ones_like(input_ids)
         outputs = self(input_ids, attention_mask)
 
@@ -112,15 +110,12 @@ class Transformer(L.LightningModule):
 
     def on_train_start(self):
         self.average_train_loss = 0
+        self.save_huggingface_model()
     
     def on_before_optimizer_step(self, optimizer):
         self.logger.experiment.log_metric(self.logger.run_id, "train_loss", self.average_train_loss, step=self.logger_step)
         self.average_train_loss = 0
         self.logger_step += 1
-    
-    def on_before_zero_grad(self, optimizer):
-        if self.global_step % self.save_model_interval == 0:
-            self.save_huggingface_model()
     
     def on_train_end(self):
         self.save_huggingface_model()
@@ -141,6 +136,7 @@ class Transformer(L.LightningModule):
     
     def on_validation_end(self):
         self.logger.experiment.log_metric(self.logger.run_id, "valid_loss", self.average_valid_loss, step=self.logger_step)
+        self.save_huggingface_model()
     
     def calculate_learning_rate(self, step):
         real_step = step + 1
@@ -244,7 +240,7 @@ class Transformer(L.LightningModule):
         return loader
         
     def save_huggingface_model(self):
-        self.model.save_pretrained(f"./models/{self.logger.run_id}/{self.global_step}")
+        self.model.save_pretrained(f"./models/{self.logger.run_id}/{self.logger_step}")
 
 
 if __name__ == "__main__":

@@ -171,3 +171,4 @@ models/
 
 notes.txt
 parquet.ipynb
+petastorm_custom/
