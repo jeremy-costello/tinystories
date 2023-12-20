@@ -6,7 +6,7 @@ param_dict = {
     "tokenizer": {
         "eos_token": "<|endoftext|>",
         "tokenizer_save_location": "./tokenizers/tinystories.json",
-        "vocab_size": 10000,
+        "vocab_size": 1000,
         "batch_size": 256,
         "tokenized_parquet_root": "tinystories-tokenized"
     },
@@ -40,7 +40,7 @@ param_dict = {
     },
     "model": {
         "context_length": 512,
-        "hidden_size": 64,
+        "hidden_size": 128,
         "num_layers": 8,
         "num_heads": 16,
         "resid_pdrop": 0.1,

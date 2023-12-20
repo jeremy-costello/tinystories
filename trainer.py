@@ -7,7 +7,7 @@ from lightning.pytorch.loggers import MLFlowLogger
 from transformers import GPT2Config, GPT2LMHeadModel, PreTrainedTokenizerFast
 from transformers.pytorch_utils import Conv1D
 
-from reader import shuffle_data, ParquetDataset
+from reader import shuffle_parquet_data, ParquetDataset
 from parameters import get_param_dict
 
 
@@ -63,7 +63,7 @@ def train_model(session_name, param_dict):
     
     reload_dataloaders = param_dict["training"]["reload_dataloaders"]
     if reload_dataloaders:
-        shuffle_data(
+        shuffle_parquet_data(
             spark=param_dict["spark"],
             data_split="valid",
             tokenized_parquet_root=param_dict["tokenizer"]["tokenized_parquet_root"],
@@ -237,7 +237,7 @@ class Transformer(L.LightningModule):
 
         if self.reload_dataloaders and (shuffle_data or self.logger_step == 0):
             spark = SparkSession.builder.appName(session_name).getOrCreate()
-            shuffle_data(
+            shuffle_parquet_data(
                 spark=spark,
                 data_split=data_split,
                 tokenized_parquet_root=self.param_dict["tokenizer"]["tokenized_parquet_root"],

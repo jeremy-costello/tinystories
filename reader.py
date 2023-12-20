@@ -17,7 +17,7 @@ def main():
     param_dict = get_param_dict(session_name, load_spark=True)
 
     for data_split in data_splits:
-        shuffle_data(
+        shuffle_parquet_data(
             spark=param_dict["spark"],
             data_split=data_split,
             tokenized_parquet_root=param_dict["tokenizer"]["tokenized_parquet_root"],
@@ -47,8 +47,8 @@ class ParquetDataset(Dataset):
         }
 
 
-def shuffle_data(spark, data_split, tokenized_parquet_root, context_length,
-                 dataset_url, num_workers, partitions=None, row_limit=None):
+def shuffle_parquet_data(spark, data_split, tokenized_parquet_root, context_length,
+                         dataset_url, num_workers, partitions=None, row_limit=None):
     
     df = spark.read.parquet(f"{tokenized_parquet_root}-{data_split}.parquet")
 
