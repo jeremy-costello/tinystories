@@ -170,6 +170,7 @@ mlruns/
 models/
 
 notes.txt
+inference2.ipynb
 parquet.ipynb
 pyarrow.ipynb
 petastorm_custom/
