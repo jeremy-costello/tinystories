@@ -2,25 +2,29 @@ import math
 import torch
 import lightning as L
 from pyspark.sql import SparkSession
-from petastorm.reader import make_reader
-from petastorm.pytorch import DataLoader
+from torch.utils.data import DataLoader
 from lightning.pytorch.loggers import MLFlowLogger
 from transformers import GPT2Config, GPT2LMHeadModel, PreTrainedTokenizerFast
 from transformers.pytorch_utils import Conv1D
 
-from reader import generate_dataset, shuffle_dataset
+from reader import shuffle_data, ParquetDataset
 from parameters import get_param_dict
 
 
 def main():
     session_name = "trainer-test"
 
-    param_dict = get_param_dict(session_name, load_schema=True)
+    param_dict = get_param_dict(session_name, load_spark=False)
     train_model(session_name, param_dict)
 
 
 def train_model(session_name, param_dict):
-    n_positions = 2 * param_dict["model"]["context_length"]
+    if param_dict["training"]["float32_matmul_precision"] is not None:
+        torch.set_float32_matmul_precision(
+            param_dict["training"]["float32_matmul_precision"]
+        )
+    
+    n_positions = param_dict["model"]["context_length"]
 
     config = GPT2Config(
         vocab_size=param_dict["tokenizer"]["vocab_size"],
@@ -57,13 +61,28 @@ def train_model(session_name, param_dict):
         check_val_every_n_epoch=None,
         num_sanity_val_steps=0)
     
-    generate_dataset(session_name, data_splits=["valid"])
-    
+    reload_dataloaders = param_dict["training"]["reload_dataloaders"]
+    if reload_dataloaders:
+        shuffle_data(
+            spark=param_dict["spark"],
+            data_split="valid",
+            tokenized_parquet_root=param_dict["tokenizer"]["tokenized_parquet_root"],
+            context_length=param_dict["model"]["context_length"],
+            dataset_url=param_dict["dataset"]["dataset_url"],
+            num_workers=param_dict["dataset"]["num_workers"]
+        )
+    # param_dict["spark"].stop()
+
     dataset_url = param_dict["dataset"]["dataset_url"]
     dataset_url_data_split = f"{dataset_url}/valid"
-    petastorm_reader = make_reader(dataset_url_data_split)
-    valid_loader = DataLoader(petastorm_reader, batch_size=param_dict["training"]["batch_size"])
+    valid_dataset = ParquetDataset(dataset_url_data_split)
     
+    num_workers = param_dict["dataset"]["num_workers"]
+    valid_loader = DataLoader(valid_dataset,
+                              batch_size=param_dict["training"]["batch_size"],
+                              shuffle=False,
+                              pin_memory=True,
+                              num_workers=num_workers)
     trainer.fit(model, val_dataloaders=[valid_loader])
 
 
@@ -71,6 +90,7 @@ class Transformer(L.LightningModule):
     def __init__(self, config, param_dict):
         super().__init__()
 
+        self.reload_dataloaders = param_dict["training"]["reload_dataloaders"]
         self.shuffle_data = param_dict["training"]["shuffle_data"]
         self.learning_rate = param_dict["training"]["learning_rate"]
         self.betas = param_dict["training"]["betas"]
@@ -91,18 +111,17 @@ class Transformer(L.LightningModule):
         self.tokenizer.eos_token = param_dict["tokenizer"]["eos_token"]
 
         self.logger_step = 0
+        self.datasets = dict()
     
-    def forward(self, input_ids, attention_mask):
+    def forward(self, input_ids):
         return self.model(
             input_ids=input_ids,
-            attention_mask=attention_mask,
             labels=input_ids
         )
 
     def training_step(self, batch, batch_idx):
         input_ids = batch["input_ids"]
-        attention_mask = torch.ones_like(input_ids)
-        outputs = self(input_ids, attention_mask)
+        outputs = self(input_ids)
 
         loss = outputs.loss
         self.average_train_loss += loss
@@ -122,8 +141,7 @@ class Transformer(L.LightningModule):
     
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
         input_ids = batch["input_ids"]
-        attention_mask = torch.ones_like(input_ids)
-        outputs = self(input_ids, attention_mask)
+        outputs = self(input_ids)
 
         loss = outputs.loss
         self.average_valid_loss = \
@@ -213,26 +231,32 @@ class Transformer(L.LightningModule):
     
     def on_epoch_end(self):
         self.trainer.train_dataloader.__exit__(None, None, None)
-            
+    
     def get_dataloader(self, data_split, shuffle_data):
         session_name = f"petastorm-reader-{data_split}"
 
-        if shuffle_data:
+        if self.reload_dataloaders and (shuffle_data or self.logger_step == 0):
             spark = SparkSession.builder.appName(session_name).getOrCreate()
-            shuffle_dataset(spark=spark,
-                            data_split=data_split,
-                            tokenized_parquet_root=self.param_dict["tokenizer"]["tokenized_parquet_root"],
-                            context_length=self.param_dict["model"]["context_length"],
-                            dataset_url=self.dataset_url,
-                            hdfs_home=self.param_dict["dataset"]["hdfs_home"],
-                            row_group_size_mb=self.param_dict["dataset"]["row_group_size_mb"],
-                            num_spark_workers=self.param_dict["dataset"]["num_spark_workers"],
-                            petastorm_schema=self.param_dict["dataset"]["petastorm_schema"])
+            shuffle_data(
+                spark=spark,
+                data_split=data_split,
+                tokenized_parquet_root=self.param_dict["tokenizer"]["tokenized_parquet_root"],
+                context_length=self.param_dict["model"]["context_length"],
+                dataset_url=self.dataset_url,
+                num_workers=self.param_dict["dataset"]["num_workers"]
+            )
             spark.stop()
 
         dataset_url_data_split = f"{self.dataset_url}/{data_split}"
-        petastorm_reader = make_reader(dataset_url_data_split)
-        loader = DataLoader(petastorm_reader, batch_size=self.batch_size)
+        dataset = ParquetDataset(dataset_url_data_split)
+        self.datasets[data_split] = dataset
+
+        num_workers = self.param_dict["dataset"]["num_workers"]
+        loader = DataLoader(self.datasets[data_split],
+                            batch_size=self.batch_size,
+                            shuffle=True,
+                            pin_memory=True,
+                            num_workers=num_workers)
         return loader
 
     def train_dataloader(self):
