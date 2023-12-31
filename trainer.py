@@ -112,6 +112,37 @@ class Transformer(L.LightningModule):
 
         self.logger_step = 0
         self.datasets = dict()
+
+        self.activation_norms = {
+            "attention": [],
+            "mlp": []
+        }
+
+        self.hooks = []
+
+        self.module_names = dict()
+
+        for mn, m in self.model.named_modules():
+            hook = None
+            if mn.endswith('.attn'):
+                hook = m.register_forward_hook(self.attention_forward_hook)
+            elif mn.endswith('.mlp'):
+                hook = m.register_forward_hook(self.mlp_forward_hook)
+            
+            if hook is not None:
+                self.hooks.append(hook)
+    
+    def attention_forward_hook(self, module, input, output):
+        output = output[0].detach()
+        self.activation_norms["attention"].append(output.norm())
+    
+    def mlp_forward_hook(self, module, input, output):
+        output = output.detach()
+        self.activation_norms["mlp"].append(output.norm())
+    
+    def remove_hooks(self):
+        for hook in self.hooks:
+            hook.remove()
     
     def forward(self, input_ids):
         return self.model(
@@ -131,6 +162,11 @@ class Transformer(L.LightningModule):
         self.average_train_loss = 0
         self.save_huggingface_model()
     
+    def on_after_backward(self):
+        self.log_parameter_norm()
+        self.log_gradient_norm()
+        self.log_activation_norm()
+
     def on_before_optimizer_step(self, optimizer):
         self.logger.experiment.log_metric(self.logger.run_id, "train_loss", self.average_train_loss, step=self.logger_step)
         self.average_train_loss = 0
@@ -265,6 +301,37 @@ class Transformer(L.LightningModule):
         
     def save_huggingface_model(self):
         self.model.save_pretrained(f"./models/{self.logger.run_id}/{self.logger_step}")
+    
+    def log_parameter_norm(self):
+        average_param_norm = 0
+
+        for i, parameter in enumerate(self.model.parameters()):
+            average_param_norm = i / (i + 1) * average_param_norm + 1 / (i + 1) * parameter.norm().item()
+        
+        self.logger.experiment.log_metric(self.logger.run_id, "param_norm", average_param_norm, step=self.logger_step)
+    
+    def log_gradient_norm(self):
+        average_grad_norm = 0
+
+        i = 0
+        for parameter in self.model.parameters():
+            if parameter.grad is not None:
+                average_grad_norm = i / (i + 1) * average_grad_norm + 1 / (i + 1) * parameter.grad.norm().item()
+                i += 1
+        
+        self.logger.experiment.log_metric(self.logger.run_id, "grad_norm", average_grad_norm, step=self.logger_step)
+    
+    def log_activation_norm(self):
+        average_attention_norm = sum(self.activation_norms["attention"]) / len(self.activation_norms["attention"])
+        self.logger.experiment.log_metric(self.logger.run_id, "attention_norm", average_attention_norm, step=self.logger_step)
+
+        average_attention_norm = sum(self.activation_norms["mlp"]) / len(self.activation_norms["mlp"])
+        self.logger.experiment.log_metric(self.logger.run_id, "mlp_norm", average_attention_norm, step=self.logger_step)
+
+        self.activation_norms = {
+            "attention": [],
+            "mlp": []
+        }
 
 
 if __name__ == "__main__":
