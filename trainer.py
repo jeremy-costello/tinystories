@@ -1,11 +1,14 @@
 import math
 import torch
+import flash_attn
 import lightning as L
+from torchmetrics import Metric
+from flash_attn.losses.cross_entropy import CrossEntropyLoss
 from pyspark.sql import SparkSession
 from torch.utils.data import DataLoader
+from flash_attn.models.gpt import GPTLMHeadModel
 from lightning.pytorch.loggers import MLFlowLogger
-from transformers import GPT2Config, GPT2LMHeadModel, PreTrainedTokenizerFast
-from transformers.pytorch_utils import Conv1D
+from transformers import GPT2Config, PreTrainedTokenizerFast
 
 from reader import shuffle_parquet_data, ParquetDataset
 from parameters import get_param_dict
@@ -23,8 +26,9 @@ def train_model(session_name, param_dict):
         torch.set_float32_matmul_precision(
             param_dict["training"]["float32_matmul_precision"]
         )
-    
-    n_positions = param_dict["model"]["context_length"]
+
+    n_positions = 0
+    n_inner = 4 * param_dict["model"]["hidden_size"]
 
     config = GPT2Config(
         vocab_size=param_dict["tokenizer"]["vocab_size"],
@@ -32,11 +36,32 @@ def train_model(session_name, param_dict):
         n_embd=param_dict["model"]["hidden_size"],
         n_layer=param_dict["model"]["num_layers"],
         n_head=param_dict["model"]["num_heads"],
+        n_inner=n_inner,
+        activation_function="gelu_fast",
         resid_pdrop=param_dict["model"]["resid_pdrop"],
         embd_pdrop=param_dict["model"]["embd_pdrop"],
         attn_pdrop=param_dict["model"]["attn_pdrop"],
+        layer_norm_epsilon=1e-5,
+        initializer_range=0.02,
         bos_token_id=0,
-        eos_token_id=0
+        eos_token_id=0,
+        rms_norm=True,
+        rotary_emb_fraction=1.0,
+        rotary_emb_interleaved=True,
+        tie_word_embeddings=False,
+        qkv_proj_bias=False,
+        out_proj_bias=False,
+        mlp_fc1_bias=False,
+        mlp_fc2_bias=False,
+        rotary_emb_base=10000.0,
+        n_head_kv=4,
+        scale_attn_by_inverse_layer_idx=True,
+        reorder_and_upcast_attn=True,
+        use_flash_attn=True,
+        fused_mlp=True,
+        fused_bias_fc=True,
+        fused_dropout_add_ln=True, 
+        pad_vocab_size_multiple=8
     )
 
     model = Transformer(
@@ -86,6 +111,31 @@ def train_model(session_name, param_dict):
     trainer.fit(model, val_dataloaders=[valid_loader])
 
 
+# https://docs.mosaicml.com/projects/composer/en/stable/_modules/composer/metrics/metrics.html#CrossEntropy
+class CrossEntropyMetric(Metric):
+    full_state_update = False
+
+    def __init__(self, ignore_index=-100, label_smoothing=0.0, dist_sync_on_step=False):
+        super().__init__(dist_sync_on_step=dist_sync_on_step)
+        self.cross_entropy = CrossEntropyLoss(
+            ignore_index=ignore_index,
+            label_smoothing=label_smoothing
+        )
+        self.add_state("sum_loss", default=torch.tensor(0.), dist_reduce_fx="sum")
+        self.add_state("total_batches", default=torch.tensor(0.), dist_reduce_fx="sum")
+    
+    def update(self, preds: torch.Tensor, targets: torch.Tensor) -> None:
+        self.sum_loss += self.cross_entropy(preds, targets)
+        assert isinstance(self.total_batches, torch.Tensor)
+        self.total_batches += 1
+    
+    def compute(self) -> torch.Tensor:
+        assert isinstance(self.total_batches, torch.Tensor)
+        assert isinstance(self.sum_loss, torch.Tensor)
+        return self.sum_loss / self.total_batches
+        
+
+
 class Transformer(L.LightningModule):
     def __init__(self, config, param_dict):
         super().__init__()
@@ -103,12 +153,15 @@ class Transformer(L.LightningModule):
 
         self.param_dict = param_dict
 
-        self.model = GPT2LMHeadModel(config)
+        self.model = GPTLMHeadModel(config)
         self.tokenizer = PreTrainedTokenizerFast(
             tokenizer_file=param_dict["tokenizer"]["tokenizer_save_location"]
         )
         self.tokenizer.bos_token = param_dict["tokenizer"]["eos_token"]
         self.tokenizer.eos_token = param_dict["tokenizer"]["eos_token"]
+
+        self.train_cross_entropy = CrossEntropyMetric()
+        self.valid_cross_entropy = CrossEntropyMetric()
 
         self.logger_step = 0
         self.datasets = dict()
@@ -124,21 +177,21 @@ class Transformer(L.LightningModule):
 
         for mn, m in self.model.named_modules():
             hook = None
-            if mn.endswith('.attn'):
+            if False: # mn.endswith('.attn'):
                 hook = m.register_forward_hook(self.attention_forward_hook)
-            elif mn.endswith('.mlp'):
+            elif False: # mn.endswith('.mlp'):
                 hook = m.register_forward_hook(self.mlp_forward_hook)
             
             if hook is not None:
                 self.hooks.append(hook)
     
     def attention_forward_hook(self, module, input, output):
-        output = output[0].detach()
-        self.activation_norms["attention"].append(output.norm())
+        output = output[0].detach().norm()
+        self.activation_norms["attention"].append(output)
     
     def mlp_forward_hook(self, module, input, output):
-        output = output.detach()
-        self.activation_norms["mlp"].append(output.norm())
+        output = output.detach().norm()
+        self.activation_norms["mlp"].append(output)
     
     def remove_hooks(self):
         for hook in self.hooks:
@@ -146,20 +199,23 @@ class Transformer(L.LightningModule):
     
     def forward(self, input_ids):
         return self.model(
-            input_ids=input_ids,
-            labels=input_ids
+            input_ids=input_ids
         )
 
     def training_step(self, batch, batch_idx):
         input_ids = batch["input_ids"]
         outputs = self(input_ids)
+        logits = outputs.logits
 
-        loss = outputs.loss
-        self.average_train_loss += loss
+        # https://github.com/huggingface/transformers/blob/main/src/transformers/models/gpt2/modeling_gpt2.py#L1098
+        loss = None
+        labels = input_ids.to(logits.device)
+        shift_logits = logits[..., :-1, :].contiguous()
+        shift_labels = labels[..., 1:].contiguous()
+        loss = self.train_cross_entropy(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
         return loss
 
     def on_train_start(self):
-        self.average_train_loss = 0
         self.save_huggingface_model()
     
     def on_after_backward(self):
@@ -168,8 +224,7 @@ class Transformer(L.LightningModule):
         self.log_activation_norm()
 
     def on_before_optimizer_step(self, optimizer):
-        self.logger.experiment.log_metric(self.logger.run_id, "train_loss", self.average_train_loss, step=self.logger_step)
-        self.average_train_loss = 0
+        self.logger.experiment.log_metric(self.logger.run_id, "train_loss", self.train_cross_entropy.compute().item(), step=self.logger_step)
         self.logger_step += 1
     
     def on_train_end(self):
@@ -178,18 +233,21 @@ class Transformer(L.LightningModule):
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
         input_ids = batch["input_ids"]
         outputs = self(input_ids)
+        logits = outputs.logits
 
-        loss = outputs.loss
-        self.average_valid_loss = \
-            batch_idx / (batch_idx + 1) * self.average_valid_loss + 1 / (batch_idx + 1) * loss
-        
+        # https://github.com/huggingface/transformers/blob/main/src/transformers/models/gpt2/modeling_gpt2.py#L1098
+        loss = None
+        labels = input_ids.to(logits.device)
+        shift_logits = logits[..., :-1, :].contiguous()
+        shift_labels = labels[..., 1:].contiguous()
+        loss = self.valid_cross_entropy(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
         return loss
 
     def on_validation_start(self):
-        self.average_valid_loss = 0
+        pass
     
     def on_validation_end(self):
-        self.logger.experiment.log_metric(self.logger.run_id, "valid_loss", self.average_valid_loss, step=self.logger_step)
+        self.logger.experiment.log_metric(self.logger.run_id, "valid_loss", self.valid_cross_entropy.compute().item(), step=self.logger_step)
         self.save_huggingface_model()
     
     def calculate_learning_rate(self, step):
@@ -207,19 +265,12 @@ class Transformer(L.LightningModule):
         # https://github.com/karpathy/minGPT/blob/master/mingpt/model.py
         decay = set()
         no_decay = set()
-        whitelist_weight_modules = (torch.nn.Linear, Conv1D)
-        blacklist_weight_modules = (torch.nn.LayerNorm, torch.nn.Embedding)
-
-        lm_head_name = "model.lm_head.weight"
+        whitelist_weight_modules = (torch.nn.modules.linear.Linear,)
+        blacklist_weight_modules = (torch.nn.modules.sparse.Embedding, flash_attn.ops.rms_norm.RMSNorm)
 
         for mn, m in self.named_modules():
             for pn, p in m.named_parameters():
-                fpn = '%s.%s' % (mn, pn) if mn else pn
-
-                # same parameter as 'model.transformer.wte.weight'
-                if fpn == lm_head_name:
-                    continue
-                
+                fpn = '%s.%s' % (mn, pn) if mn else pn                
                 if pn.endswith('bias'):
                     no_decay.add(fpn)
                 elif pn.endswith('weight') and isinstance(m, whitelist_weight_modules):
@@ -300,7 +351,8 @@ class Transformer(L.LightningModule):
         return loader
         
     def save_huggingface_model(self):
-        self.model.save_pretrained(f"./models/{self.logger.run_id}/{self.logger_step}")
+        pass
+        # self.model.save_pretrained(f"./models/{self.logger.run_id}/{self.logger_step}")
     
     def log_parameter_norm(self):
         average_param_norm = 0
@@ -322,10 +374,10 @@ class Transformer(L.LightningModule):
         self.logger.experiment.log_metric(self.logger.run_id, "grad_norm", average_grad_norm, step=self.logger_step)
     
     def log_activation_norm(self):
-        average_attention_norm = sum(self.activation_norms["attention"]) / len(self.activation_norms["attention"])
+        average_attention_norm = 0 # sum(self.activation_norms["attention"]) / len(self.activation_norms["attention"])
         self.logger.experiment.log_metric(self.logger.run_id, "attention_norm", average_attention_norm, step=self.logger_step)
 
-        average_attention_norm = sum(self.activation_norms["mlp"]) / len(self.activation_norms["mlp"])
+        average_attention_norm = 0 # sum(self.activation_norms["mlp"]) / len(self.activation_norms["mlp"])
         self.logger.experiment.log_metric(self.logger.run_id, "mlp_norm", average_attention_norm, step=self.logger_step)
 
         self.activation_norms = {

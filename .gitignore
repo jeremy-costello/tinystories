@@ -169,6 +169,7 @@ tokenizers/*
 mlruns/
 models/
 petastorm_custom/
+flash-attention/
 
 *.txt
 *.ipynb

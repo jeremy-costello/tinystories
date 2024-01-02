@@ -6,7 +6,7 @@ param_dict = {
     "tokenizer": {
         "eos_token": "<|endoftext|>",
         "tokenizer_save_location": "./tokenizers/tinystories.json",
-        "vocab_size": 2000,
+        "vocab_size": 5000,
         "batch_size": 256,
         "tokenized_parquet_root": "tinystories-tokenized"
     },
@@ -22,30 +22,30 @@ param_dict = {
     "training": {
         "accelerator": "gpu",
         "devices": 1,
-        "strategy": "deepspeed_stage_1",
+        "strategy": "deepspeed_stage_2",
         "precision": "bf16-mixed",
         "float32_matmul_precision": "medium",
         "reload_dataloaders": False,
         "shuffle_data": False,
         "max_steps": 5000,
         "warmup_steps": 500,
-        "accumulate_grad_batches": 32,
+        "accumulate_grad_batches": 4,
         "gradient_clip_val": 1.0,
-        "val_check_interval": 1280,
-        "batch_size": 32,
-        "learning_rate": 5e-5,
+        "val_check_interval": 320,
+        "batch_size": 128,
+        "learning_rate": 2e-4,
         "betas": (0.9, 0.95),
         "weight_decay": 0.01,
         "final_lr_multiplier": 0.1
     },
     "model": {
         "context_length": 512,
-        "hidden_size": 256,
-        "num_layers": 8,
+        "hidden_size": 1024,
+        "num_layers": 2,
         "num_heads": 16,
-        "resid_pdrop": 0.1,
-        "embd_pdrop": 0.1,
-        "attn_pdrop": 0.1
+        "resid_pdrop": 0.0,
+        "embd_pdrop": 0.0,
+        "attn_pdrop": 0.0
     }
 }
 
