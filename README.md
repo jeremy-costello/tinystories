@@ -23,3 +23,4 @@ This requires Hadoop. I used [this guide](https://kontext.tech/article/978/insta
 - use torchmetrics for loss
 - use flashattention2 model and cross-entropy loss
 - use tensorboard instead of MLflow
+- use deepspeed optimizer/scheduler
