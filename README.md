@@ -16,7 +16,10 @@ This requires Hadoop. I used [this guide](https://kontext.tech/article/978/insta
 # todo
 - requirements.txt / poetry installer
 - checkpoint saving and restarting
-- tracking parameter, activation, gradient norms
 - add docstrings
 - add explanations for parameters
 - find good settings for stable training
+- use hydra for config
+- use torchmetrics for loss
+- use flashattention2 model and cross-entropy loss
+- use tensorboard instead of MLflow
