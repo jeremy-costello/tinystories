@@ -162,12 +162,16 @@ cython_debug/
 # Custom
 petastorm_data/train/*
 petastorm_data/valid/*
+data/*
+!data/.gitkeep
+models/*
+!models/.gitkeep
 texts/*
 !texts/.gitkeep
 tokenizers/*
 !tokenizers/.gitkeep
-mlruns/
-models/
+/tb_logs/*
+!tb_logs/.gitkeep
 petastorm_custom/
 flash-attention/
 

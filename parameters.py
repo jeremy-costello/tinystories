@@ -6,13 +6,13 @@ param_dict = {
     "tokenizer": {
         "eos_token": "<|endoftext|>",
         "tokenizer_save_location": "./tokenizers/tinystories.json",
-        "vocab_size": 5000,
+        "vocab_size": 8192,
         "batch_size": 256,
         "tokenized_parquet_root": "tinystories-tokenized"
     },
     "dataset": {
         "text_folder": "./texts",
-        "raw_text_file_root": "TinyStoriesV2-GPT4",
+        "raw_text_file_root": "tinystories_tar",
         "preprocessed_file_root": "tinystories",
         "splitter": "<|SPLIT|>\n",
         "data_parquet_root": "tinystories",
@@ -27,25 +27,25 @@ param_dict = {
         "float32_matmul_precision": "medium",
         "reload_dataloaders": False,
         "shuffle_data": False,
-        "max_steps": 5000,
-        "warmup_steps": 500,
-        "accumulate_grad_batches": 4,
+        "max_steps": 6400,
+        "warmup_steps": 160,
+        "accumulate_grad_batches": 8,
         "gradient_clip_val": 1.0,
         "val_check_interval": 320,
         "batch_size": 128,
-        "learning_rate": 2e-4,
-        "betas": (0.9, 0.95),
-        "weight_decay": 0.01,
+        "learning_rate": 5e-5,
+        "betas": (0.9, 0.98),
+        "weight_decay": 0.1,
         "final_lr_multiplier": 0.1
     },
     "model": {
         "context_length": 512,
-        "hidden_size": 1024,
-        "num_layers": 2,
+        "hidden_size": 256,
+        "num_layers": 8,
         "num_heads": 16,
-        "resid_pdrop": 0.0,
-        "embd_pdrop": 0.0,
-        "attn_pdrop": 0.0
+        "resid_pdrop": 0.2,
+        "embd_pdrop": 0.2,
+        "attn_pdrop": 0.2
     }
 }
 

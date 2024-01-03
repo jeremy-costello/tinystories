@@ -1,13 +1,15 @@
 import math
+import time
 import torch
 import flash_attn
 import lightning as L
-from torchmetrics import Metric
+from torchmetrics import Metric, MeanMetric
 from flash_attn.losses.cross_entropy import CrossEntropyLoss
 from pyspark.sql import SparkSession
 from torch.utils.data import DataLoader
 from flash_attn.models.gpt import GPTLMHeadModel
-from lightning.pytorch.loggers import MLFlowLogger
+from lightning.pytorch.loggers import TensorBoardLogger
+from lightning.pytorch.callbacks import ModelCheckpoint
 from transformers import GPT2Config, PreTrainedTokenizerFast
 
 from reader import shuffle_parquet_data, ParquetDataset
@@ -45,6 +47,7 @@ def train_model(session_name, param_dict):
         initializer_range=0.02,
         bos_token_id=0,
         eos_token_id=0,
+        prenorm=True,
         rms_norm=True,
         rotary_emb_fraction=1.0,
         rotary_emb_interleaved=True,
@@ -69,22 +72,35 @@ def train_model(session_name, param_dict):
         param_dict=param_dict
     )
 
-    mlf_logger = MLFlowLogger(
-        experiment_name=session_name,
-        tracking_uri="file:./mlruns")
+    tb_logger = TensorBoardLogger(
+        save_dir="./tb_logs",
+        name=session_name
+    )
+    
+    checkpoint_callback = ModelCheckpoint(
+        save_top_k=3,
+        monitor="global_step",
+        mode="max",
+        dirpath=f"./models/{int(time.time())}",
+        filename="model-{global_step}",
+        every_n_train_steps=40,
+        save_on_train_epoch_end=False
+    )
     
     trainer = L.Trainer(
         accelerator=param_dict["training"]["accelerator"],
         devices=param_dict["training"]["devices"],
         strategy=param_dict["training"]["strategy"],
         precision=param_dict["training"]["precision"],
-        logger=mlf_logger,
+        logger=tb_logger,
+        callbacks=[checkpoint_callback],
         max_steps=param_dict["training"]["max_steps"],
         accumulate_grad_batches=param_dict["training"]["accumulate_grad_batches"],
         gradient_clip_val=param_dict["training"]["gradient_clip_val"],
         val_check_interval=param_dict["training"]["val_check_interval"],
         check_val_every_n_epoch=None,
-        num_sanity_val_steps=0)
+        num_sanity_val_steps=0,
+        log_every_n_steps=4)
     
     reload_dataloaders = param_dict["training"]["reload_dataloaders"]
     if reload_dataloaders:
@@ -111,31 +127,6 @@ def train_model(session_name, param_dict):
     trainer.fit(model, val_dataloaders=[valid_loader])
 
 
-# https://docs.mosaicml.com/projects/composer/en/stable/_modules/composer/metrics/metrics.html#CrossEntropy
-class CrossEntropyMetric(Metric):
-    full_state_update = False
-
-    def __init__(self, ignore_index=-100, label_smoothing=0.0, dist_sync_on_step=False):
-        super().__init__(dist_sync_on_step=dist_sync_on_step)
-        self.cross_entropy = CrossEntropyLoss(
-            ignore_index=ignore_index,
-            label_smoothing=label_smoothing
-        )
-        self.add_state("sum_loss", default=torch.tensor(0.), dist_reduce_fx="sum")
-        self.add_state("total_batches", default=torch.tensor(0.), dist_reduce_fx="sum")
-    
-    def update(self, preds: torch.Tensor, targets: torch.Tensor) -> None:
-        self.sum_loss += self.cross_entropy(preds, targets)
-        assert isinstance(self.total_batches, torch.Tensor)
-        self.total_batches += 1
-    
-    def compute(self) -> torch.Tensor:
-        assert isinstance(self.total_batches, torch.Tensor)
-        assert isinstance(self.sum_loss, torch.Tensor)
-        return self.sum_loss / self.total_batches
-        
-
-
 class Transformer(L.LightningModule):
     def __init__(self, config, param_dict):
         super().__init__()
@@ -160,10 +151,10 @@ class Transformer(L.LightningModule):
         self.tokenizer.bos_token = param_dict["tokenizer"]["eos_token"]
         self.tokenizer.eos_token = param_dict["tokenizer"]["eos_token"]
 
-        self.train_cross_entropy = CrossEntropyMetric()
-        self.valid_cross_entropy = CrossEntropyMetric()
+        self.criterion = CrossEntropyLoss()
+        self.train_loss = MeanMetric()
+        self.valid_loss = MeanMetric()
 
-        self.logger_step = 0
         self.datasets = dict()
 
         self.activation_norms = {
@@ -212,20 +203,23 @@ class Transformer(L.LightningModule):
         labels = input_ids.to(logits.device)
         shift_logits = logits[..., :-1, :].contiguous()
         shift_labels = labels[..., 1:].contiguous()
-        loss = self.train_cross_entropy(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+        loss = self.criterion(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+        self.train_loss(loss)
+        self.log("train_loss", self.train_loss, on_step=True, on_epoch=False, prog_bar=True)
+        self.log("global_step", torch.tensor(self.global_step, dtype=torch.float32), on_step=True, on_epoch=False, prog_bar=True)
         return loss
 
     def on_train_start(self):
         self.save_huggingface_model()
     
     def on_after_backward(self):
-        self.log_parameter_norm()
-        self.log_gradient_norm()
-        self.log_activation_norm()
+        # self.log_parameter_norm()
+        # self.log_gradient_norm()
+        # self.log_activation_norm()
+        pass
 
     def on_before_optimizer_step(self, optimizer):
-        self.logger.experiment.log_metric(self.logger.run_id, "train_loss", self.train_cross_entropy.compute().item(), step=self.logger_step)
-        self.logger_step += 1
+        pass
     
     def on_train_end(self):
         self.save_huggingface_model()
@@ -240,14 +234,15 @@ class Transformer(L.LightningModule):
         labels = input_ids.to(logits.device)
         shift_logits = logits[..., :-1, :].contiguous()
         shift_labels = labels[..., 1:].contiguous()
-        loss = self.valid_cross_entropy(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+        loss = self.criterion(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+        self.valid_loss(loss)
+        self.log("valid_loss", self.valid_loss, on_step=False, on_epoch=True, prog_bar=True)
         return loss
 
     def on_validation_start(self):
         pass
     
     def on_validation_end(self):
-        self.logger.experiment.log_metric(self.logger.run_id, "valid_loss", self.valid_cross_entropy.compute().item(), step=self.logger_step)
         self.save_huggingface_model()
     
     def calculate_learning_rate(self, step):
@@ -258,7 +253,7 @@ class Transformer(L.LightningModule):
             lr_mult = self.final_lr_multiplier  + 0.5 * (1 - self.final_lr_multiplier) * \
                 (1 + math.cos(math.pi * (real_step - self.warmup_steps) / (self.max_steps - self.warmup_steps)))
         
-        self.logger.experiment.log_metric(self.logger.run_id, "lr", self.learning_rate * lr_mult, step=self.logger_step)
+        # self.logger.experiment.log_metric(self.logger.run_id, "lr", self.learning_rate * lr_mult, step=self.logger_step)
         return lr_mult
 
     def get_weight_decay_groups(self):
@@ -270,7 +265,8 @@ class Transformer(L.LightningModule):
 
         for mn, m in self.named_modules():
             for pn, p in m.named_parameters():
-                fpn = '%s.%s' % (mn, pn) if mn else pn                
+                fpn = '%s.%s' % (mn, pn) if mn else pn
+
                 if pn.endswith('bias'):
                     no_decay.add(fpn)
                 elif pn.endswith('weight') and isinstance(m, whitelist_weight_modules):
@@ -314,7 +310,6 @@ class Transformer(L.LightningModule):
     
     def on_epoch_start(self):
         self.trainer.train_dataloader = self.train_dataloader()
-        self.within_epoch_step = 0
     
     def on_epoch_end(self):
         self.trainer.train_dataloader.__exit__(None, None, None)
@@ -322,7 +317,7 @@ class Transformer(L.LightningModule):
     def get_dataloader(self, data_split, shuffle_data):
         session_name = f"petastorm-reader-{data_split}"
 
-        if self.reload_dataloaders and (shuffle_data or self.logger_step == 0):
+        if self.reload_dataloaders and (shuffle_data or self.global_step == 0):
             spark = SparkSession.builder.appName(session_name).getOrCreate()
             shuffle_parquet_data(
                 spark=spark,
@@ -352,7 +347,6 @@ class Transformer(L.LightningModule):
         
     def save_huggingface_model(self):
         pass
-        # self.model.save_pretrained(f"./models/{self.logger.run_id}/{self.logger_step}")
     
     def log_parameter_norm(self):
         average_param_norm = 0
@@ -360,7 +354,7 @@ class Transformer(L.LightningModule):
         for i, parameter in enumerate(self.model.parameters()):
             average_param_norm = i / (i + 1) * average_param_norm + 1 / (i + 1) * parameter.norm().item()
         
-        self.logger.experiment.log_metric(self.logger.run_id, "param_norm", average_param_norm, step=self.logger_step)
+        # self.logger.experiment.log_metric(self.logger.run_id, "param_norm", average_param_norm, step=self.logger_step)
     
     def log_gradient_norm(self):
         average_grad_norm = 0
@@ -371,14 +365,14 @@ class Transformer(L.LightningModule):
                 average_grad_norm = i / (i + 1) * average_grad_norm + 1 / (i + 1) * parameter.grad.norm().item()
                 i += 1
         
-        self.logger.experiment.log_metric(self.logger.run_id, "grad_norm", average_grad_norm, step=self.logger_step)
+        # self.logger.experiment.log_metric(self.logger.run_id, "grad_norm", average_grad_norm, step=self.logger_step)
     
     def log_activation_norm(self):
         average_attention_norm = 0 # sum(self.activation_norms["attention"]) / len(self.activation_norms["attention"])
-        self.logger.experiment.log_metric(self.logger.run_id, "attention_norm", average_attention_norm, step=self.logger_step)
+        # self.logger.experiment.log_metric(self.logger.run_id, "attention_norm", average_attention_norm, step=self.logger_step)
 
         average_attention_norm = 0 # sum(self.activation_norms["mlp"]) / len(self.activation_norms["mlp"])
-        self.logger.experiment.log_metric(self.logger.run_id, "mlp_norm", average_attention_norm, step=self.logger_step)
+        # self.logger.experiment.log_metric(self.logger.run_id, "mlp_norm", average_attention_norm, step=self.logger_step)
 
         self.activation_norms = {
             "attention": [],
